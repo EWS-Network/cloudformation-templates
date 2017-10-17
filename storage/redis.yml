@@ -1,0 +1,182 @@
+---
+################################################################################
+#
+# Description
+#
+
+Description: >-
+  Convention : <VPCName>-<Name>
+
+################################################################################
+#
+# Parameters
+#
+
+Parameters:
+
+  RedisInstanceType:
+    Description: EC2 instance type
+    Type: String
+    Default: cache.t2.medium
+    AllowedValues:
+      - cache.t2.medium
+
+      - cache.m3.medium
+      - cache.m3.large
+      - cache.m3.xlarge
+      - cache.m3.2xlarge
+
+      - cache.m4.large
+      - cache.m4.xlarge
+      - cache.m4.2xlarge
+      - cache.m4.4xlarge
+
+      - cache.r3.large
+      - cache.r3.xlarge
+      - cache.r3.2xlarge
+
+  UseCluster:
+    Description: >-
+      Define whether or not deploy a Redis cluster
+    Type: String
+    Default: "Yes"
+    AllowedValues:
+      - "Yes"
+      - "No"
+
+
+################################################################################
+#
+# Conditions
+#
+
+Conditions:
+  isClustered:
+    Fn::Equals:
+      - !Ref UseCluster
+      - "Yes"
+
+  notClustered:
+    Fn::Equals:
+      - !Ref UseCluster
+      - "No"
+
+
+################################################################################
+#
+# Resources
+#
+
+Resources:
+
+
+  ##############################################################################
+  #
+  # Lambda Functions
+  #
+
+  lambdaGetVpcId:
+    Type: AWS::CloudFormation::CustomResource
+    Version: '1.0'
+    Properties:
+      ServiceToken: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:getVpcId'
+      VpcName: !Select [0, !Split [ "-", !Ref "AWS::StackName"]]
+
+  lambdaGetSubnets:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn: lambdaGetVpcId
+    Version: '1.0'
+    Properties:
+      ServiceToken: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:getSubnetsLayers'
+      VpcId: !GetAtt [ lambdaGetVpcId, 'VpcId' ]
+
+  ##############################################################################
+  #
+  # REDIS
+  #
+
+  singleRedis:
+    Condition: notClustered
+    Type: AWS::ElastiCache::CacheCluster
+    DependsOn:
+      - lambdaGetSubnets
+    Properties:
+      AutoMinorVersionUpgrade: true
+      CacheNodeType: !Ref RedisInstanceType
+      CacheSubnetGroupName: !Ref cacheSubnetGroup
+      Engine: redis
+      EngineVersion: 3.2.4
+      Port: 6379
+      NumCacheNodes: 1
+      VpcSecurityGroupIds:
+        - !GetAtt [ sgCache, GroupId ]
+
+
+  clusterRedis:
+    Condition: isClustered
+    Type: "AWS::ElastiCache::ReplicationGroup"
+    Properties:
+      ReplicationGroupDescription: "Redis replication group"
+      NumCacheClusters: "2"
+      Engine: "redis"
+      CacheNodeType: !Ref RedisInstanceType
+      AutoMinorVersionUpgrade: "true"
+      AutomaticFailoverEnabled: "true"
+      CacheSubnetGroupName: !Ref cacheSubnetGroup
+      EngineVersion: "3.2.4"
+      PreferredMaintenanceWindow: "sun:09:25-sun:22:30"
+      SnapshotRetentionLimit: "7"
+      SnapshotWindow: "03:30-05:30"
+      SecurityGroupIds:
+        - Ref: sgCache
+
+  cacheSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      Description: Subnet group for Redis
+      SubnetIds: !GetAtt [lambdaGetSubnets, 'Storage']
+
+
+  ##############################################################################
+  #
+  # Security Groups
+  #
+
+  sgCache:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Cache Security Group
+      VpcId: !GetAtt [ lambdaGetVpcId, VpcId ]
+      Tags:
+        - Key: Name
+          Value: !Sub 'sg-cache-${AWS::StackName}'
+
+
+
+################################################################################
+#
+# Outputs
+#
+
+Outputs:
+
+  RedisClusterName:
+    Value: !If [ isClustered, !Ref clusterRedis, !Ref singleRedis ]
+
+  RedisAddress:
+    Value: !If [ notClustered, !GetAtt [ singleRedis, 'RedisEndpoint.Address' ], !Ref "AWS::NoValue" ]
+    Export:
+      Name: !Sub '${AWS::StackName}-redisUri'
+
+  RedisSg:
+    Value: !GetAtt [ sgCache , 'GroupId' ]
+    Export:
+      Name: !Sub '${AWS::StackName}-redisSg'
+
+################################################################################
+#
+# Never changes
+#
+
+AWSTemplateFormatVersion: '2010-09-09'
+

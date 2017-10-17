@@ -1,0 +1,159 @@
+---
+################################################################################
+#
+# Description
+#
+
+Description: >-
+  Convention : VPCName-<Name>
+
+################################################################################
+#
+# Parameters
+#
+
+Parameters:
+
+  EfsHighThroughput:
+    Description: >-
+      http://docs.aws.amazon.com/efs/latest/ug/performance.html
+    Type: String
+    AllowedValues:
+      - "True"
+      - "False"
+    Default: "True"
+
+  EfsKmsKey:
+    Description: >-
+      KMS Key ID to encrypt the EFS
+    Type: String
+    Default: "Default"
+
+################################################################################
+#
+# Conditions
+#
+
+Conditions:
+  conditionHighThroughtput:
+    Fn::Equals:
+      - !Ref EfsHighThroughput
+      - "True"
+
+  conditionEfsKmsKeySet:
+    Fn::Not:
+      - Fn::Equals:
+          - !Ref EfsKmsKey
+          - "Default"
+
+
+################################################################################
+#
+# Resources
+#
+
+Resources:
+
+  lambdaGetVpcId:
+    Type: AWS::CloudFormation::CustomResource
+    Version: '1.0'
+    Properties:
+      ServiceToken: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:getVpcId'
+      VpcName: !Select [0, !Split [ "-", !Ref "AWS::StackName"]]
+
+  lambdaGetSubnets:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn: lambdaGetVpcId
+    Version: '1.0'
+    Properties:
+      ServiceToken: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:getSubnetsLayers'
+      VpcId: !GetAtt [ lambdaGetVpcId, 'VpcId' ]
+
+  ##############################################################################
+  #
+  # Network and Security Group
+  #
+
+
+  sgEfs:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: EFS Security Group
+      VpcId: !GetAtt [ lambdaGetVpcId, VpcId ]
+      Tags:
+      - Key: Name
+        Value: !Sub 'sg-efs-${AWS::StackName}'
+
+
+
+  ##############################################################################
+  #
+  # EFS
+  #
+
+  efsFS:
+    Type: AWS::EFS::FileSystem
+    DependsOn:
+      - lambdaGetSubnets
+    Properties:
+      PerformanceMode: !If [ conditionHighThroughtput, 'maxIO', 'generalPurpose' ]
+      Encrypted: True
+      KmsKeyId: !If [ conditionEfsKmsKeySet, !Ref EfsKmsKey, !Ref "AWS::NoValue" ]
+      FileSystemTags:
+      - Key: Name
+        Value: !Sub 'efs-${AWS::StackName}'
+
+  efsMountPointAZ1:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref efsFS
+      SecurityGroups:
+        - !GetAtt [ sgEfs, GroupId ]
+      SubnetId: !Select ['0', !GetAtt [lambdaGetSubnets, 'Storage']]
+
+  efsMountPointAZ2:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref efsFS
+      SecurityGroups:
+        - !GetAtt [ sgEfs, GroupId ]
+      SubnetId: !Select ['1', !GetAtt [lambdaGetSubnets, 'Storage']]
+
+  efsMountPointAZ3:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref efsFS
+      SecurityGroups:
+        - !GetAtt [ sgEfs, GroupId ]
+      SubnetId: !Select ['2', !GetAtt [lambdaGetSubnets, 'Storage']]
+
+
+################################################################################
+#
+# Outputs
+#
+
+Outputs:
+
+  efsId:
+    Value: !Ref efsFS
+    Export:
+      Name: !Sub '${AWS::StackName}-efsId'
+
+  efsUri:
+    Value: !Sub '${efsFS}.efs.eu-west-1.amazonaws.com'
+    Export:
+      Name: !Sub '${AWS::StackName}-efsUri'
+
+  efsSg:
+    Value: !GetAtt [ sgEfs, 'GroupId']
+    Export:
+      Name: !Sub '${AWS::StackName}-efsSg'
+
+
+################################################################################
+#
+# Never changes
+#
+
+AWSTemplateFormatVersion: '2010-09-09'
