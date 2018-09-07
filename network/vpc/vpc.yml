@@ -10,22 +10,29 @@ Parameters:
     Description: >-
       Block CIDR pour le VPC
 
-  Environment:
+  VPCName:
     Type: String
     Description: >-
       VPC name
+    AllowedPattern: '[\x20-\x7E]*'
+
+  AppSubnetPublic:
+    Type: String
     AllowedValues:
-      - prod
-      - development
-      - test
-      - staging
+      - True
+      - False
+    Default: False
+
 
 ################################################################################
 #
 # Conditions
 #
 
-# Conditions:
+Conditions:
+  useNat: !Equals [ !Ref AppSubnetPublic, 'False' ]
+  appPublic: !Equals [ !Ref AppSubnetPublic, 'True']
+
 
 
 ################################################################################
@@ -34,6 +41,9 @@ Parameters:
 #
 
 Resources:
+
+  
+
 
   ##############################################################################
   #
@@ -63,9 +73,9 @@ Resources:
       EnableDnsHostnames: True
       Tags:
         - Key: Name
-          Value: !Ref Environment
+          Value: !Ref VPCName
         - Key: VPCName
-          Value: !Ref Environment
+          Value: !Ref VPCName
 
 
   ##############################################################################
@@ -85,7 +95,7 @@ Resources:
         - Key: Layer
           Value: Public
         - Key: VPCName
-          Value: !Ref Environment
+          Value: !Ref VPCName
       VpcId: !Ref rootVpc
 
   publicSubnetB:
@@ -100,7 +110,7 @@ Resources:
         - Key: Layer
           Value: Public
         - Key: VPCName
-          Value: !Ref Environment
+          Value: !Ref VPCName
       VpcId: !Ref rootVpc
 
   publicSubnetC:
@@ -115,7 +125,7 @@ Resources:
         - Key: Layer
           Value: Public
         - Key: VPCName
-          Value: !Ref Environment
+          Value: !Ref VPCName
       VpcId: !Ref rootVpc
 
   ##############################################################################
@@ -128,14 +138,14 @@ Resources:
     Properties:
       AvailabilityZone: !Sub '${AWS::Region}a'
       CidrBlock: !Select [ 0, !GetAtt [ lambdaGetSubnetsCidr , 'AppSubnets']]
-      MapPublicIpOnLaunch: False
+      MapPublicIpOnLaunch: !If [ appPublic, True, False ]
       Tags:
         - Key: Name
           Value: AppSubnetA
         - Key: Layer
           Value: App
         - Key: VPCName
-          Value: !Ref Environment
+          Value: !Ref VPCName
       VpcId: !Ref rootVpc
 
   appSubnetB:
@@ -143,14 +153,14 @@ Resources:
     Properties:
       AvailabilityZone: !Sub '${AWS::Region}b'
       CidrBlock: !Select [ 1, !GetAtt [ lambdaGetSubnetsCidr , 'AppSubnets']]
-      MapPublicIpOnLaunch: False
+      MapPublicIpOnLaunch: !If [ appPublic, True, False ]
       Tags:
         - Key: Name
           Value: AppSubnetB
         - Key: Layer
           Value: App
         - Key: VPCName
-          Value: !Ref Environment
+          Value: !Ref VPCName
       VpcId: !Ref rootVpc
 
   appSubnetC:
@@ -158,14 +168,14 @@ Resources:
     Properties:
       AvailabilityZone: !Sub '${AWS::Region}c'
       CidrBlock: !Select [ 2, !GetAtt [ lambdaGetSubnetsCidr , 'AppSubnets']]
-      MapPublicIpOnLaunch: False
+      MapPublicIpOnLaunch: !If [ appPublic, True, False ]
       Tags:
         - Key: Name
           Value: AppSubnetC
         - Key: Layer
           Value: App
         - Key: VPCName
-          Value: !Ref Environment
+          Value: !Ref VPCName
       VpcId: !Ref rootVpc
 
   ##############################################################################
@@ -185,7 +195,7 @@ Resources:
         - Key: Layer
           Value: Storage
         - Key: VPCName
-          Value: !Ref Environment
+          Value: !Ref VPCName
       VpcId: !Ref rootVpc
 
   storageSubnetB:
@@ -200,7 +210,7 @@ Resources:
         - Key: Layer
           Value: Storage
         - Key: VPCName
-          Value: !Ref Environment
+          Value: !Ref VPCName
 
       VpcId: !Ref rootVpc
 
@@ -216,7 +226,7 @@ Resources:
         - Key: Layer
           Value: Storage
         - Key: VPCName
-          Value: !Ref Environment
+          Value: !Ref VPCName
 
       VpcId: !Ref rootVpc
 
@@ -230,9 +240,9 @@ Resources:
     Properties:
       Tags:
         - Key: Name
-          Value: !Sub '${Environment}-igw'
+          Value: !Sub '${VPCName}-igw'
         - Key: VPCName
-          Value: !Ref Environment
+          Value: !Ref VPCName
 
   internetGatewayAttach:
     Type: "AWS::EC2::VPCGatewayAttachment"
@@ -247,11 +257,13 @@ Resources:
 
   appNatGatewayEip:
     Type: "AWS::EC2::EIP"
+    Condition: useNat
     Properties:
       Domain: vpc
 
   appNatGatewayA:
     Type: "AWS::EC2::NatGateway"
+    Condition: useNat
     Properties:
       AllocationId: !GetAtt [ appNatGatewayEip, 'AllocationId' ]
       SubnetId: !Ref publicSubnetA
@@ -270,7 +282,7 @@ Resources:
         - Key: Name
           Value: Public-rtb
         - Key: VPCName
-          Value: !Ref Environment
+          Value: !Ref VPCName
 
 
   appSubnetsRtb:
@@ -281,7 +293,7 @@ Resources:
         - Key: Name
           Value: App-rtb
         - Key: VPCName
-          Value: !Ref Environment
+          Value: !Ref VPCName
 
 
   storageSubnetsRtb:
@@ -292,7 +304,7 @@ Resources:
         - Key: Name
           Value: Storage-rtb
         - Key: VPCName
-          Value: !Ref Environment
+          Value: !Ref VPCName
 
 
   ##############################################################################
@@ -309,9 +321,18 @@ Resources:
 
   appSubnetsDefaultRoute:
     Type: "AWS::EC2::Route"
+    Condition: useNat
     Properties:
       DestinationCidrBlock: '0.0.0.0/0'
       NatGatewayId: !Ref appNatGatewayA
+      RouteTableId: !Ref appSubnetsRtb
+
+  appSubnetsDefaultRoute:
+    Type: "AWS::EC2::Route"
+    Condition: appPublic
+    Properties:
+      DestinationCidrBlock: '0.0.0.0/0'
+      NatGatewayId: !Ref internetGateway
       RouteTableId: !Ref appSubnetsRtb
 
 
