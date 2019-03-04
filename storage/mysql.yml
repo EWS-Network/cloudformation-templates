@@ -1,0 +1,259 @@
+---
+################################################################################
+#
+# Description
+#
+
+Description: >-
+  Convention: <VPCName>-<stackname> Template to create the RDS MySQL instance.
+
+################################################################################
+#
+# Parameters
+#
+
+Parameters:
+
+  ApplicationName:
+    Type: String
+    Description: >-
+      Short name of the application
+    AllowedPattern: '[\x20-\x7E]*'
+
+
+  DBEngineName:
+    Type: String
+    AllowedValues:
+      - mariadb
+      - mysql
+
+
+  DBEngineVersion:
+    Type: String
+    Description: >-
+      Specific version of the engine to use (report to RDS documentation) if non-default
+    AllowedPattern: '[\x20-\x7E]*'
+    Default: Default
+
+
+  DBInstanceType:
+    Type: String
+    Description: >-
+      DB Instance Type
+    AllowedValues:
+      - db.t2.small
+      - db.t2.medium
+      - db.t2.large
+      - db.t2.xlarge
+      - db.t2.2xlarge
+      - db.m4.large
+      - db.m4.xlarge
+      - db.m4.2xlarge
+      - db.m4.4xlarge
+      - db.r4.large
+      - db.r4.xlarge
+      - db.r4.2xlarge
+      - db.r4.4xlarge
+
+
+  DiskSize:
+    Type: String
+    Description: >-
+      Size of the EBS disk for the instance, in GB
+    AllowedPattern: '[0-9]+'
+
+
+  MultiAZ:
+    Description: >-
+      Select if deployment should be multi AZ
+    Type: String
+    AllowedValues:
+      - "True"
+      - "False"
+    Default: "True"
+
+
+  SsmKmsKeyId:
+    Description: >-
+      KMS Key used to encrypt data in SSM
+    Type: String
+    AllowedPattern: '[\x20-\x7E]*'
+
+
+  RdsKmsKeyId:
+    Description: >-
+      KMS Key ID to use to encrypt the Aurora Storage (leave to Default to use AWS' default)
+    Type: String
+    Default: Default
+    AllowedPattern: '[\x20-\x7E]*'
+
+################################################################################
+#
+# CONDITIONS
+#
+
+Conditions:
+  rdsSpecificKey:
+    Fn::Not:
+      - Fn::Equals:
+          - !Ref RdsKmsKeyId
+          - Default
+
+  specificEngineVersion:
+    Fn::Not:
+      - Fn::Equals:
+          - !Ref DBEngineVersion
+          - Default
+
+
+################################################################################
+#
+# MAPPINGS
+#
+
+
+################################################################################
+#
+# RESOURCES
+#
+
+Resources:
+
+  ##############################################################################
+  #
+  # The LambdaFunctions
+  #
+
+  lambdaGetVpcId:
+    Type: AWS::CloudFormation::CustomResource
+    Version: '1.0'
+    Properties:
+      ServiceToken: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:getVpcId'
+      VpcName: !Select [0, !Split [ '-', !Ref "AWS::StackName" ]]
+
+  lambdaGetSubnets:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn: lambdaGetVpcId
+    Version: '1.0'
+    Properties:
+      ServiceToken: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:getSubnetsLayers'
+      VpcId: !GetAtt [ lambdaGetVpcId, 'VpcId' ]
+
+  lambdaGenerateUserPassword:
+    Type: AWS::CloudFormation::CustomResource
+    Version: '1.0'
+    Properties:
+      ServiceToken: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:cfSsmSecureString'
+      StackName: !Sub '${ApplicationName}-${AWS::StackName}'
+      KeyId: !Ref SsmKmsKeyId
+
+################################################################################
+
+
+
+  ##############################################################################
+  #
+  # The RDS
+  #
+
+  rdsSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: !Sub 'SubnetGroup for RDS for ${AWS::StackName}'
+      SubnetIds: !GetAtt [ lambdaGetSubnets, 'Storage' ]
+      Tags:
+        - Key: VPCName
+          Value: !Select [0, !Split [ '-', !Ref "AWS::StackName" ]]
+        - Key: StackName
+          Value: !Ref AWS::StackName
+
+
+  rdsInstance:
+    Type: "AWS::RDS::DBInstance"
+    DeletionPolicy: Snapshot
+    DependsOn:
+      - lambdaGetSubnets
+      - lambdaGetVpcId
+      - lambdaGenerateUserPassword
+      - rdsSubnetGroup
+    Properties:
+      AllocatedStorage: !Ref "DiskSize"
+      DBInstanceClass: !Ref "DBInstanceType"
+      DBName: !Sub 'db${ApplicationName}root'
+      DBSubnetGroupName: !Ref rdsSubnetGroup
+      Engine: !Ref 'DBEngineName'
+      EngineVersion: !If [ specificEngineVersion, !Ref "DBEngineVersion", !Ref "AWS::NoValue" ]
+      MultiAZ: !Ref "MultiAZ"
+      StorageEncrypted: True
+      KmsKeyId:
+        Fn::If:
+          - rdsSpecificKey
+          - !Ref RdsKmsKeyId
+          - !Ref AWS::NoValue
+
+      MasterUsername: !GetAtt [ lambdaGenerateUserPassword, 'username' ]
+      MasterUserPassword: !GetAtt [ lambdaGenerateUserPassword, 'password' ]
+      PreferredBackupWindow: 06:00-07:00
+      PreferredMaintenanceWindow: Sun:23:00-Mon:00:45
+      BackupRetentionPeriod: 31
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-aurora'
+        - Key: VPCName
+          Value: !Select [0, !Split [ '-', !Ref "AWS::StackName" ]]
+      VPCSecurityGroups:
+        - !GetAtt [ sgDatabase, 'GroupId' ]
+
+
+
+  ##############################################################################
+  #
+  # Security Group
+  #
+
+  sgDatabase:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: RDS DB  Security Group
+      VpcId: !GetAtt [ lambdaGetVpcId, 'VpcId' ]
+      Tags:
+      - Key: Name
+        Value: !Sub 'sg-database-${AWS::StackName}'
+
+
+################################################################################
+#
+# OUTPUTS
+#
+
+
+Outputs:
+  rdsDatabaseName:
+    Description: Name of the RDS Instance
+    Value: !Ref rdsInstance
+
+  rdsDatabaseEndpoint:
+    Description: A record to use as the CNAME for the mysql DB
+    Value: !GetAtt [ rdsInstance , Endpoint.Address]
+    Export:
+      Name: !Sub '${AWS::StackName}-dbEndpoint'
+
+  rdsDatabaseName:
+    Description: A record to use as the CNAME for the mysql DB
+    Value: !Sub 'db${ApplicationName}root'
+    Export:
+      Name: !Sub '${AWS::StackName}-dbName'
+
+  rdsDatabaseSecurityGroup:
+    Description: SG ID of the RDS Instance
+    Value: !GetAtt [ sgDatabase, GroupId ]
+    Export:
+      Name: !Sub '${AWS::StackName}-dbGroupId'
+
+
+################################################################################
+#
+# NEVER CHANGE
+#
+
+AWSTemplateFormatVersion: '2010-09-09'

@@ -1,0 +1,333 @@
+---
+################################################################################
+#
+# Description
+#
+
+Description: >-
+  Template to create the RDS Aurora Cluster
+  Version : 2017-06-20
+  Author: John "Preston" M.
+
+################################################################################
+#
+# Parameters
+#
+
+Parameters:
+  VPCName:
+    Description: Name of the VPC in which  will be deployed
+    Type: String
+    MinLength: '3'
+    MaxLength: '255'
+    AllowedPattern: '[\x20-\x7E]*'
+    ConstraintDescription: can contain only ASCII characters.
+    Default: dev
+    AllowedValues:
+      - prod
+      - dev
+      - test
+      - staging
+
+  DBInstanceType:
+    Type: String
+    Description: >-
+      DB Instance Type
+    AllowedValues:
+      - db.t2.small
+      - db.t2.medium
+      - db.t2.large
+      - db.r3.large
+      - db.r3.xlarge
+      - db.r3.2xlarge
+      - db.r3.4xlarge
+      - db.r3.8xlarge
+
+  CloudFormationKmsKeyAlias:
+    Description: >-
+      Alias of the KMS Key used to encrypt data in DynamoDB
+    Type: String
+    AllowedPattern: '[\x20-\x7E]*'
+
+  RdsKmsKeyAlias:
+    Description: >-
+      KMS Key Alias to use to encrypt the Aurora Storage (leave to NONE to use default
+    Type: String
+    Default: None
+    AllowedPattern: '[\x20-\x7E]*'
+
+################################################################################
+#
+# CONDITIONS
+#
+
+Conditions:
+  isProd:
+    Fn::Equals:
+      - !Ref VPCName
+      - prod
+
+  rdsSpecificKey:
+    Fn::Not:
+      - Fn::Equals:
+          - !Ref RdsKmsKeyAlias
+          - None
+
+
+################################################################################
+#
+# MAPPINGS
+#
+
+Mappings:
+  DynDbTables:
+    master:
+      name: rdsmaster
+    apps:
+      name: rdsapps
+
+
+################################################################################
+#
+# RESOURCES
+#
+
+Resources:
+
+  ##############################################################################
+  #
+  # The LambdaFunctions
+  #
+
+  lambdaGetKmsKeyId:
+    Type: AWS::CloudFormation::CustomResource
+    Version: '1.0'
+    Properties:
+      ServiceToken: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:getKmsId'
+      KeyAlias: !Ref CloudFormationKmsKeyAlias
+
+
+  lambdaGetKmsRdsKeyId:
+    Type: AWS::CloudFormation::CustomResource
+    Condition: rdsSpecificKey
+    Version: '1.0'
+    Properties:
+      ServiceToken: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:getKmsId'
+      KeyAlias: !Ref RdsKmsKeyAlias
+
+  lambdaSetRdsMasterCreds:
+    DependsOn:
+      - lambdaGetKmsKeyId
+    Type: AWS::CloudFormation::CustomResource
+    Version: '1.0'
+    Properties:
+      ServiceToken: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:setRdsMasterCreds'
+      KeyId: !GetAtt [ lambdaGetKmsKeyId, 'KeyId' ]
+      StackName: !Ref AWS::StackName
+      TableName: !FindInMap [ DynDbTables, master, name ]
+
+
+  lambdaGetRdsMasterCreds:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn:
+      - lambdaSetRdsMasterCreds
+    Version: '1.0'
+    Properties:
+      ServiceToken: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:getRdsMasterCreds'
+      StackName: !Ref AWS::StackName
+      TableName: !FindInMap [ DynDbTables, master, name ]
+
+  lambdaGetVpcId:
+    Type: AWS::CloudFormation::CustomResource
+    Version: '1.0'
+    Properties:
+      ServiceToken: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:getVpcId'
+      VpcName: !Ref VPCName
+
+  lambdaGetSubnets:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn: lambdaGetVpcId
+    Version: '1.0'
+    Properties:
+      ServiceToken: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:getLayersSubnets'
+      VpcId: !GetAtt [ lambdaGetVpcId, 'VpcId' ]
+
+
+  ##############################################################################
+  #
+  # The Aurora Cluster
+  #
+
+  rdsSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: !Sub 'SubnetGroup for RDS in ${VPCName} for ${AWS::StackName}'
+      SubnetIds: !GetAtt [ lambdaGetSubnets, 'Storage' ]
+      Tags:
+        - Key: VPCName
+          Value: !Ref VPCName
+        - Key: StackName
+          Value: !Ref AWS::StackName
+
+  rdsDbClusterParams:
+    Type: "AWS::RDS::DBClusterParameterGroup"
+    DependsOn:
+      - lambdaGetSubnets
+      - lambdaGetVpcId
+      - lambdaGetRdsMasterCreds
+      - lambdaSetRdsMasterCreds
+    Properties:
+      Description: "Aurora 5.6 binlog_format enabled in MIXED mode"
+      Family: aurora5.6
+      Parameters:
+        binlog_format: MIXED
+
+  rdsAuroraCluster:
+    Type: "AWS::RDS::DBCluster"
+    DeletionPolicy: Snapshot
+    DependsOn:
+      - lambdaGetSubnets
+      - lambdaGetVpcId
+      - lambdaGetRdsMasterCreds
+      - lambdaSetRdsMasterCreds
+      - rdsSubnetGroup
+    Properties:
+      DatabaseName: !GetAtt [ lambdaGetRdsMasterCreds, 'DBName' ]
+      DBClusterParameterGroupName: !Ref rdsDbClusterParams
+      DBSubnetGroupName: !Ref rdsSubnetGroup
+      Engine: aurora
+      EngineVersion: 5.6.10a
+      StorageEncrypted: !If [ isProd, true, false ]
+      KmsKeyId:
+        Fn::If:
+          - rdsSpecificKey
+          - !GetAtt [ lambdaGetKmsRdsKeyId, 'KeyId' ]
+          - !Ref AWS::NoValue
+
+      MasterUsername: !GetAtt [ lambdaGetRdsMasterCreds, 'Username' ]
+      MasterUserPassword: !GetAtt [ lambdaGetRdsMasterCreds, 'Password' ]
+      PreferredBackupWindow: 01:00-02:00
+      PreferredMaintenanceWindow: Sat:23:00-Sun:00:45
+      BackupRetentionPeriod:
+        Fn::If:
+          - isProd
+          - 31
+          - !Ref AWS::NoValue
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-aurora'
+        - Key: VPCName
+          Value: !Ref VPCName
+      VpcSecurityGroupIds:
+        - !GetAtt [ sgDatabase, 'GroupId' ]
+
+  RDSDBInstanceA:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    DependsOn:
+      - rdsAuroraCluster
+    Properties:
+      DBSubnetGroupName: !Ref rdsSubnetGroup
+      Engine: aurora
+      DBClusterIdentifier: !Ref rdsAuroraCluster
+      PubliclyAccessible: False
+      DBInstanceClass: !Ref DBInstanceType
+      Tags:
+        - Key: Name
+          Value: !Sub 'rds-Aurora-${AWS::StackName}-${VPCName}'
+        - Key: VPCName
+          Value: !Ref VPCName
+        - Key: AuroraCluster
+          Value: !Ref rdsAuroraCluster
+
+  RDSDBInstanceB:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    DependsOn:
+      - rdsAuroraCluster
+    Properties:
+      DBSubnetGroupName: !Ref rdsSubnetGroup
+      Engine: aurora
+      DBClusterIdentifier: !Ref rdsAuroraCluster
+      PubliclyAccessible: False
+      DBInstanceClass: !Ref DBInstanceType
+      Tags:
+        - Key: Name
+          Value: !Sub 'rds-Aurora-${AWS::StackName}-${VPCName}'
+        - Key: VPCName
+          Value: !Ref VPCName
+        - Key: AuroraCluster
+          Value: !Ref rdsAuroraCluster
+
+  RDSDBInstanceC:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    DependsOn:
+      - rdsAuroraCluster
+    Properties:
+      DBSubnetGroupName: !Ref rdsSubnetGroup
+      Engine: aurora
+      DBClusterIdentifier: !Ref rdsAuroraCluster
+      PubliclyAccessible: False
+      DBInstanceClass: !Ref DBInstanceType
+      Tags:
+        - Key: Name
+          Value: !Sub 'rds-Aurora-${AWS::StackName}-${VPCName}'
+        - Key: VPCName
+          Value: !Ref VPCName
+        - Key: AuroraCluster
+          Value: !Ref rdsAuroraCluster
+
+
+  ##############################################################################
+  #
+  # Security Group
+  #
+
+  sgDatabase:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: RDS DB  Security Group
+      VpcId: !GetAtt [ lambdaGetVpcId, 'VpcId' ]
+      Tags:
+      - Key: Name
+        Value: !Sub 'sg-database-${AWS::StackName}'
+
+
+################################################################################
+#
+# OUTPUTS
+#
+
+
+Outputs:
+  rdsDatabaseName:
+    Description: Name of the RDS Instance
+    Value: !Ref rdsAuroraCluster
+
+
+  rdsDatabaseEndpoint:
+    Description: A record to use as the CNAME for the mysql DB
+    Value: !GetAtt [ rdsAuroraCluster, Endpoint.Address]
+    Export:
+      Name: !Sub '${AWS::StackName}-dbEndpoint'
+
+  rdsDatabaseReadEndpoint:
+    Description: A record to use as the CNAME for the mysql DB
+    Value: !GetAtt [ rdsAuroraCluster, ReadEndpoint.Address]
+    Export:
+      Name: !Sub '${AWS::StackName}-dbReadEndpoint'
+
+  rdsDatabaseSecurityGroup:
+    Description: SG ID of the RDS Instance
+    Value: !GetAtt [ sgDatabase, GroupId ]
+    Export:
+      Name: !Sub '${AWS::StackName}-dbGroupId'
+
+
+################################################################################
+#
+# NEVER CHANGE
+#
+
+AWSTemplateFormatVersion: '2010-09-09'
